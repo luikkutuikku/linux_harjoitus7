@@ -1,0 +1,63 @@
+name: CI/CD Deploy
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_test_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run container test
+        run: |
+          chmod +x tests/container_test.sh
+          ./tests/container_test.sh cicd-app:test
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        run: |
+          IMAGE="${{ secrets.DOCKERHUB_USER }}/cicd-app:${{ github.sha }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy on VPS via SSH (kubectl)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            # apply manifest suoraan GitHubista (ei tarvitse kopioida tiedostoja VPS:lle)
+            curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/k8s/deploy.yaml" | kubectl apply -f -
+
+            # secrets: ei commitata arvoja repoon
+            kubectl -n cicd create secret generic cicd-secrets \
+              --from-literal=MYSQL_USER="${{ secrets.MYSQL_USER }}" \
+              --from-literal=MYSQL_PASSWORD="${{ secrets.MYSQL_PASSWORD }}" \
+              --from-literal=MYSQL_ROOT_PASSWORD="${{ secrets.MYSQL_ROOT_PASSWORD }}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            # päivitä imaget (php + initContainer)
+            kubectl -n cicd set image deployment/cicd-web \
+              php="${{ secrets.DOCKERHUB_USER }}/cicd-app:${{ github.sha }}" \
+              init-code="${{ secrets.DOCKERHUB_USER }}/cicd-app:${{ github.sha }}"
+
+            # näkyviin sivulle build SHA
+            kubectl -n cicd set env deployment/cicd-web GIT_SHA="${{ github.sha }}"
+
+            kubectl -n cicd rollout status deployment/cicd-web --timeout=180s
