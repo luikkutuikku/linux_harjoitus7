@@ -1,0 +1,144 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cicd
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cicd-nginx-conf
+  namespace: cicd
+data:
+  default.conf: |
+    server {
+      listen 80;
+      server_name _;
+      root /var/www/html/public;
+      index index.php index.html;
+
+      location / {
+        try_files $uri $uri/ /index.php?$query_string;
+      }
+
+      location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass 127.0.0.1:9000;
+      }
+
+      location = /healthz { return 200 "ok\n"; }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cicd-mysql
+  namespace: cicd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cicd-mysql
+  template:
+    metadata:
+      labels:
+        app: cicd-mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_DATABASE
+              value: "cicd"
+            - name: MYSQL_USER
+              valueFrom: { secretKeyRef: { name: cicd-secrets, key: MYSQL_USER } }
+            - name: MYSQL_PASSWORD
+              valueFrom: { secretKeyRef: { name: cicd-secrets, key: MYSQL_PASSWORD } }
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: cicd-secrets, key: MYSQL_ROOT_PASSWORD } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cicd-mysql
+  namespace: cicd
+spec:
+  selector:
+    app: cicd-mysql
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cicd-web
+  namespace: cicd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cicd-web
+  template:
+    metadata:
+      labels:
+        app: cicd-web
+    spec:
+      volumes:
+        - name: webroot
+          emptyDir: {}
+        - name: nginxconf
+          configMap:
+            name: cicd-nginx-conf
+      initContainers:
+        - name: init-code
+          image: luikkutuikku/cicd-app:latest
+          command: ["sh", "-c", "cp -a /var/www/html/. /work/"]
+          volumeMounts:
+            - name: webroot
+              mountPath: /work
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: webroot
+              mountPath: /var/www/html
+              readOnly: true
+            - name: nginxconf
+              mountPath: /etc/nginx/conf.d
+        - name: php
+          image: luikkutuikku/cicd-app:latest
+          ports:
+            - containerPort: 9000
+          env:
+            - name: DB_HOST
+              value: "cicd-mysql"
+            - name: DB_NAME
+              value: "cicd"
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: cicd-secrets, key: MYSQL_USER } }
+            - name: DB_PASS
+              valueFrom: { secretKeyRef: { name: cicd-secrets, key: MYSQL_PASSWORD } }
+            - name: GIT_SHA
+              value: "unknown"
+          volumeMounts:
+            - name: webroot
+              mountPath: /var/www/html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cicd-web
+  namespace: cicd
+spec:
+  type: NodePort
+  selector:
+    app: cicd-web
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30081
